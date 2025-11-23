@@ -52,3 +52,51 @@
       │ CEX Allocation │
       │ (Claimable)    │
       └────────────────┘
+
+
+Flow Highlights
+
+1. Presale → Buyers
+
+Tokens go instantly to buyers.
+
+No vesting.
+
+
+
+2. Airdrop → Proportional to Presale
+
+Each user gets a share based on their presale contribution.
+
+Claimed 2x/year; missed claims expire.
+
+
+
+3. Expired/Unclaimed Airdrops → Recovered
+
+Owner or multisig can move tokens back to liquidity or any wallet.
+
+These recovered tokens can be reused for CEX allocations or other pools.
+
+
+
+4. Team / Foundation Vesting
+
+Linear vesting over 10 years, auto-release every 6 months.
+
+
+
+5. Liquidity Pool
+
+Holds all remaining tokens after presale, airdrop, team/foundation.
+
+Source for CEX allocations or any recovered airdrop tokens.
+
+
+
+6. CEX Allocation
+
+Only from liquidity pool.
+
+Users claim allocated tokens directly.
+
