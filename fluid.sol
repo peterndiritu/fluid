@@ -1,284 +1,275 @@
-
-// File: FluidToken.sol
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-/*
-FluidToken (FLUID)
-
-- ERC20 token, total supply 10,000,000
-- Presale, airdrops, team, foundation & liquidity allocations
-- 10-year vesting for airdrops
-- Owner can pause or modify airdrops
-- Burn and cross-chain mint support to maintain 10M total supply
-- CEX liquidity allocation post-deployment
-*/
-
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/token/ERC20/ERC20.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/token/ERC20/IERC20.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/token/ERC20/utils/SafeERC20.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.3/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 interface AggregatorV3Interface {
-    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
+    function latestRoundData() external view returns (uint80,int256,uint256,uint256,uint80);
     function decimals() external view returns (uint8);
 }
 
-contract FluidToken is ERC20, Ownable {
+contract FLDTokenManager {
     using SafeERC20 for IERC20;
 
-    // ----- Supply -----
+    IERC20 public token;
+
+    // ----- Multisig -----
+    address[3] public signers;
+    mapping(bytes32 => mapping(address => bool)) public approvals;
+    mapping(bytes32 => bool) public executed;
+
+    modifier onlySigner() {
+        require(msg.sender == signers[0] || msg.sender == signers[1] || msg.sender == signers[2], "Not signer");
+        _;
+    }
+
+    constructor(address _token, address[3] memory _signers) {
+        require(_token != address(0), "Invalid token");
+        token = IERC20(_token);
+        for (uint i = 0; i < 3; i++) require(_signers[i] != address(0), "Invalid signer");
+        signers = _signers;
+    }
+
+    function _submitAndExecute(address to, bytes memory data) internal {
+        bytes32 txId = keccak256(abi.encodePacked(to, data, block.number));
+        approvals[txId][msg.sender] = true;
+
+        uint count = 0;
+        for (uint i = 0; i < 3; i++) {
+            if (approvals[txId][signers[i]]) count++;
+        }
+
+        if (count >= 3 && !executed[txId]) {
+            executed[txId] = true;
+            (bool success,) = to.call(data);
+            require(success, "Execution failed");
+        }
+    }
+
+    // ----- Supply & Allocation -----
     uint256 public constant MAX_SUPPLY = 10_000_000 * 1e18;
-    uint256 public constant PRESALE_SUPPLY = 4_000_000 * 1e18;
-    uint256 public constant AIRDROP_SUPPLY = 3_000_000 * 1e18;
-    uint256 public constant FOUNDATION_SUPPLY = 1_000_000 * 1e18;
-    uint256 public constant LIQUIDITY_SUPPLY = 1_000_000 * 1e18;
-    uint256 public constant TEAM_SUPPLY = 1_000_000 * 1e18;
 
-    // ----- Wallets -----
-    address public foundationWallet;
-    address public relayerWallet;
-    address public teamWallet;
+    uint256 public presaleSold;
+    uint256 public presaleCap = 4_000_000 * 1e18;
 
-    // ----- Price -----
+    uint256 public airdropCap = 3_000_000 * 1e18;
+    uint256 public distributedAirdrops;
+
+    uint256 public teamAllocated;
+    uint256 public foundationAllocated;
+    uint256 public liquidityAllocated;
+
+    // ----- Price / Oracles -----
     uint256 public fluidPriceUSDT6 = 1e6;
-
-    // ----- Chainlink feeds -----
     mapping(address => AggregatorV3Interface) public priceFeeds;
     AggregatorV3Interface public nativePriceFeed;
 
-    // ----- Sale tracking -----
-    uint256 public fluidSold;
+    // ----- Presale -----
+    bool public presaleActive;
 
-    // ----- Airdrop -----
-    struct AirdropInfo {
-        uint256 totalAllocated;
-        uint8 claimedYears;
-        uint256 startTime;
-        bool completed;
+    function startPresale() external onlySigner {
+        bytes memory data = abi.encodeWithSignature("startPresaleInternal()");
+        _submitAndExecute(address(this), data);
     }
-    mapping(address => AirdropInfo) public airdrops;
-    uint256 public distributedAirdrops;
-    bool public airdropActive = true;
-    uint8 public constant AIRDROP_YEARS = 10;
-
-    // ----- CEX Liquidity -----
-    mapping(address => uint256) public cexAllocation;
-    mapping(address => bool) public cexClaimed;
-
-    // ----- Events -----
-    event PriceUpdated(uint256 newPriceUSDT6);
-    event PriceFeedSet(address token, address feed);
-    event NativeFeedSet(address feed);
-    event FoundationWalletUpdated(address newWallet);
-    event RelayerWalletUpdated(address newWallet);
-    event SaleExecuted(address indexed buyer, address payToken, uint256 payAmount, uint256 fluidAmount);
-    event AirdropAllocated(address indexed user, uint256 amount);
-    event AirdropClaimed(address indexed user, uint256 amount, uint8 year);
-    event TokensBurned(address indexed from, uint256 amount);
-    event TokensMinted(address indexed to, uint256 amount);
-    event CEXAllocated(address indexed cex, uint256 amount);
-    event CEXClaimed(address indexed cex, uint256 amount);
-
-    constructor(
-        address _foundationWallet,
-        address _relayerWallet,
-        address _teamWallet
-    ) ERC20("Fluid Token", "FLUID") {
-        require(_foundationWallet != address(0), "invalid foundation wallet");
-        require(_relayerWallet != address(0), "invalid relayer wallet");
-        require(_teamWallet != address(0), "invalid team wallet");
-
-        foundationWallet = _foundationWallet;
-        relayerWallet = _relayerWallet;
-        teamWallet = _teamWallet;
-
-        _mint(address(this), MAX_SUPPLY); // All tokens minted to contract
+    function startPresaleInternal() external {
+        require(msg.sender == address(this), "Internal only");
+        presaleActive = true;
     }
 
-    // =========================
-    // ===== Admin / Config ====
-    // =========================
-    function setFluidPriceUSDT6(uint256 priceUSDT6) external onlyOwner {
-        require(priceUSDT6 > 0, "price>0");
-        fluidPriceUSDT6 = priceUSDT6;
-        emit PriceUpdated(priceUSDT6);
+    function stopPresale() external onlySigner {
+        bytes memory data = abi.encodeWithSignature("stopPresaleInternal()");
+        _submitAndExecute(address(this), data);
+    }
+    function stopPresaleInternal() external {
+        require(msg.sender == address(this), "Internal only");
+        presaleActive = false;
     }
 
-    function setPriceFeed(address token, address feed) external onlyOwner {
-        require(token != address(0) && feed != address(0), "zero addr");
-        priceFeeds[token] = AggregatorV3Interface(feed);
-        emit PriceFeedSet(token, feed);
+    function buyWithERC20(address payToken, uint256 payAmount, uint256 minOut, address buyer) external {
+        require(presaleActive, "Inactive presale");
+        require(priceFeeds[payToken] != AggregatorV3Interface(address(0)), "No feed");
+
+        uint256 fluidAmount = _calcFromERC20(payToken, payAmount);
+        require(fluidAmount >= minOut && presaleSold + fluidAmount <= presaleCap, "Invalid amount");
+
+        IERC20(payToken).safeTransferFrom(buyer, address(this), payAmount);
+        presaleSold += fluidAmount;
+        liquidityAllocated = MAX_SUPPLY - presaleSold - distributedAirdrops - teamAllocated - foundationAllocated;
+
+        token.safeTransfer(buyer, fluidAmount);
+
+        // Allocate proportional airdrop
+        uint256 airdropAlloc = (fluidAmount * airdropCap) / presaleCap;
+        _allocateAirdrop(buyer, airdropAlloc);
     }
 
-    function setNativePriceFeed(address feed) external onlyOwner {
-        require(feed != address(0), "zero feed");
-        nativePriceFeed = AggregatorV3Interface(feed);
-        emit NativeFeedSet(feed);
+    function buyWithNative(address buyer, uint256 minOut) external payable {
+        require(presaleActive, "Inactive presale");
+        uint256 fluidAmount = _calcFromNative(msg.value);
+        require(fluidAmount >= minOut && presaleSold + fluidAmount <= presaleCap, "Invalid amount");
+
+        presaleSold += fluidAmount;
+        liquidityAllocated = MAX_SUPPLY - presaleSold - distributedAirdrops - teamAllocated - foundationAllocated;
+
+        token.safeTransfer(buyer, fluidAmount);
+
+        // Allocate proportional airdrop
+        uint256 airdropAlloc = (fluidAmount * airdropCap) / presaleCap;
+        _allocateAirdrop(buyer, airdropAlloc);
     }
 
-    function setFoundationWallet(address newWallet) external onlyOwner {
-        require(newWallet != address(0), "zero");
-        foundationWallet = newWallet;
-        emit FoundationWalletUpdated(newWallet);
-    }
-
-    function setRelayerWallet(address newWallet) external onlyOwner {
-        require(newWallet != address(0), "zero");
-        relayerWallet = newWallet;
-        emit RelayerWalletUpdated(newWallet);
-    }
-
-    function setAirdropActive(bool active) external onlyOwner {
-        airdropActive = active;
-    }
-
-    function modifyUserAirdrop(address user, uint256 newTotal) external onlyOwner {
-        require(user != address(0), "invalid user");
-        AirdropInfo storage info = airdrops[user];
-        require(!info.completed, "already completed");
-        if (info.totalAllocated > distributedAirdrops) {
-            distributedAirdrops = distributedAirdrops + newTotal - info.totalAllocated;
-        } else {
-            distributedAirdrops = distributedAirdrops - info.totalAllocated + newTotal;
-        }
-        info.totalAllocated = newTotal;
-    }
-
-    // =========================
-    // ===== Burn / Mint =======
-    // =========================
-    function burn(uint256 amount) external {
-        _burn(msg.sender, amount);
-        emit TokensBurned(msg.sender, amount);
-    }
-
-    function mintCrossChain(address to, uint256 amount) external onlyOwner {
-        require(totalSupply() + amount <= MAX_SUPPLY, "exceeds max supply");
-        _mint(to, amount);
-        emit TokensMinted(to, amount);
-    }
-
-    // =========================
-    // ======== BUYING =========
-    // =========================
-    function buyWithERC20AndGas(address payToken, uint256 payAmount, uint256 gasFee) external {
-        require(payAmount > gasFee, "payAmount must > gasFee");
-        require(relayerWallet != address(0) && foundationWallet != address(0), "wallets not set");
-        require(address(priceFeeds[payToken]) != address(0), "no feed");
-
-        uint256 saleAmount = payAmount - gasFee;
-        if(gasFee > 0) IERC20(payToken).safeTransferFrom(msg.sender, relayerWallet, gasFee);
-        IERC20(payToken).safeTransferFrom(msg.sender, foundationWallet, saleAmount);
-
+    function _calcFromERC20(address payToken, uint256 amount) internal view returns (uint256) {
         AggregatorV3Interface feed = priceFeeds[payToken];
-        (, int256 price,,,) = feed.latestRoundData();
-        require(price > 0, "invalid feed");
-        uint8 aggDecimals = feed.decimals();
-        uint8 tokenDecimals;
-        try IERC20Metadata(payToken).decimals() returns (uint8 d) { tokenDecimals = d; } catch { tokenDecimals = 18; }
-
-        uint256 usd18 = (saleAmount * uint256(price) * 1e18) / ((10 ** tokenDecimals) * (10 ** aggDecimals));
-        uint256 fluidAmount = (usd18 * 1e6) / fluidPriceUSDT6;
-        require(balanceOf(address(this)) >= fluidAmount, "contract lacks FLUID");
-        require(fluidSold + fluidAmount <= PRESALE_SUPPLY, "sale supply exceeded");
-
-        _transfer(address(this), msg.sender, fluidAmount);
-        fluidSold += fluidAmount;
-
-        uint256 airdropAlloc = (fluidAmount * AIRDROP_SUPPLY) / PRESALE_SUPPLY;
-        if (airdropAlloc > 0) _allocateAirdrop(msg.sender, airdropAlloc);
-
-        emit SaleExecuted(msg.sender, payToken, payAmount, fluidAmount);
+        (, int256 price, , , ) = feed.latestRoundData();
+        require(price > 0, "Invalid price");
+        uint8 dec = feed.decimals();
+        return (amount * uint256(price) * 1e6) / (10 ** dec) / fluidPriceUSDT6;
     }
 
-    function buyWithNativeAndGas(uint256 gasFee) external payable {
-        require(msg.value > gasFee, "msg.value <= gasFee");
-        require(relayerWallet != address(0) && foundationWallet != address(0), "wallets not set");
-
-        uint256 saleAmount = msg.value - gasFee;
-
-        if(gasFee > 0) { (bool sentGas, ) = payable(relayerWallet).call{value: gasFee}(""); require(sentGas, "gas transfer failed"); }
-        (bool sentSale, ) = payable(foundationWallet).call{value: saleAmount}(""); require(sentSale, "sale transfer failed");
-
-        (, int256 answer,,,) = nativePriceFeed.latestRoundData();
-        require(answer > 0, "invalid feed");
-        uint8 aggDecimals = nativePriceFeed.decimals();
-        uint256 usd18 = (saleAmount * uint256(answer) * 1e18) / (1e18 * (10 ** aggDecimals));
-        uint256 fluidAmount = (usd18 * 1e6) / fluidPriceUSDT6;
-        require(balanceOf(address(this)) >= fluidAmount, "contract lacks FLUID");
-        require(fluidSold + fluidAmount <= PRESALE_SUPPLY, "sale supply exceeded");
-
-        _transfer(address(this), msg.sender, fluidAmount);
-        fluidSold += fluidAmount;
-
-        uint256 airdropAlloc = (fluidAmount * AIRDROP_SUPPLY) / PRESALE_SUPPLY;
-        if (airdropAlloc > 0) _allocateAirdrop(msg.sender, airdropAlloc);
-
-        emit SaleExecuted(msg.sender, address(0), msg.value, fluidAmount);
+    function _calcFromNative(uint256 amount) internal view returns (uint256) {
+        (, int256 price, , , ) = nativePriceFeed.latestRoundData();
+        require(price > 0, "Invalid price");
+        return (amount * uint256(price) * 1e6) / (10 ** nativePriceFeed.decimals()) / fluidPriceUSDT6;
     }
 
-    // =========================
-    // ======= AIRDROPS ========
-    // =========================
+    // ----- Airdrops -----
+    struct Allocation { uint256 amount; bool claimed; uint256 expiry; }
+    mapping(address => Allocation) public allocations;
+    uint256 public constant EXPIRY_PERIOD = 180 days;
+    bool public airdropActive;
+    uint256 public airdropEnd;
+
+    function startAirdrop(uint256 duration) external onlySigner {
+        bytes memory data = abi.encodeWithSignature("startAirdropInternal(uint256)", duration);
+        _submitAndExecute(address(this), data);
+    }
+    function startAirdropInternal(uint256 duration) external {
+        require(msg.sender == address(this), "Internal only");
+        airdropActive = true;
+        airdropEnd = block.timestamp + duration;
+    }
+
+    function stopAirdrop() external onlySigner {
+        bytes memory data = abi.encodeWithSignature("stopAirdropInternal()");
+        _submitAndExecute(address(this), data);
+    }
+    function stopAirdropInternal() external {
+        require(msg.sender == address(this), "Internal only");
+        airdropActive = false;
+    }
+
     function _allocateAirdrop(address user, uint256 amount) internal {
-        require(user != address(0) && amount > 0, "invalid");
-        require(distributedAirdrops + amount <= AIRDROP_SUPPLY, "exceeds pool");
-
-        AirdropInfo storage info = airdrops[user];
-        uint256 alloc = info.totalAllocated;
-        if(alloc == 0) info.startTime = block.timestamp;
-        info.totalAllocated = alloc + amount;
+        require(distributedAirdrops + amount <= airdropCap, "Airdrop cap exceeded");
+        Allocation storage a = allocations[user];
+        if (a.amount == 0) a.expiry = block.timestamp + EXPIRY_PERIOD;
+        a.amount += amount;
         distributedAirdrops += amount;
-
-        emit AirdropAllocated(user, amount);
+        liquidityAllocated = MAX_SUPPLY - presaleSold - distributedAirdrops - teamAllocated - foundationAllocated;
     }
 
     function claimAirdrop() external {
-        require(airdropActive, "airdrops paused");
-
-        AirdropInfo storage info = airdrops[msg.sender];
-        require(info.totalAllocated > 0 && !info.completed, "none or done");
-
-        uint256 yearsSince = (block.timestamp - info.startTime) / 365 days;
-        require(yearsSince >= 1, "first claim not yet");
-
-        uint8 currentYear = uint8(yearsSince);
-        require(info.claimedYears + 1 == currentYear, "already claimed/missed");
-
-        uint256 perYear = info.totalAllocated / AIRDROP_YEARS;
-        unchecked { info.claimedYears += 1; }
-        if(info.claimedYears == AIRDROP_YEARS) info.completed = true;
-
-        _transfer(address(this), msg.sender, perYear);
-        emit AirdropClaimed(msg.sender, perYear, currentYear);
+        Allocation storage a = allocations[msg.sender];
+        require(a.amount > 0 && !a.claimed && block.timestamp <= a.expiry, "Cannot claim");
+        a.claimed = true;
+        token.safeTransfer(msg.sender, a.amount);
     }
 
-    // =========================
-    // ===== CEX Liquidity ======
-    // =========================
-    function allocateLiquidityToCEX(address cex, uint256 amount) external onlyOwner {
-        require(cex != address(0), "invalid wallet");
-        require(amount > 0, "invalid amount");
-        require(cexAllocation[cex] == 0, "already allocated");
-        require(balanceOf(address(this)) >= amount, "not enough liquidity");
+    function recoverExpired(address user) external onlySigner {
+        bytes memory data = abi.encodeWithSignature("recoverExpiredInternal(address)", user);
+        _submitAndExecute(address(this), data);
+    }
+    function recoverExpiredInternal(address user) external {
+        require(msg.sender == address(this), "Internal only");
+        Allocation storage a = allocations[user];
+        require(a.amount > 0 && !a.claimed && block.timestamp > a.expiry, "Nothing expired");
+
+        distributedAirdrops -= a.amount;
+        a.amount = 0;
+        a.claimed = false;
+        a.expiry = 0;
+
+        liquidityAllocated = MAX_SUPPLY - presaleSold - distributedAirdrops - teamAllocated - foundationAllocated;
+    }
+
+    function moveUnclaimedTo(address wallet) external onlySigner {
+        bytes memory data = abi.encodeWithSignature("moveUnclaimedInternal(address)", wallet);
+        _submitAndExecute(address(this), data);
+    }
+    function moveUnclaimedInternal(address wallet) external {
+        require(msg.sender == address(this), "Internal only");
+        uint256 balance = token.balanceOf(address(this));
+        token.safeTransfer(wallet, balance);
+    }
+
+    // ----- Liquidity / CEX Allocation -----
+    mapping(address => uint256) public cexAllocation;
+    mapping(address => bool) public cexClaimed;
+
+    function allocateCEX(address cex, uint256 amount) external onlySigner {
+        require(cex != address(0), "Invalid CEX");
+        require(amount > 0 && cexAllocation[cex] == 0, "Already allocated");
+        require(liquidityAllocated >= amount, "Insufficient liquidity");
 
         cexAllocation[cex] = amount;
-        emit CEXAllocated(cex, amount);
+        liquidityAllocated -= amount;
     }
 
-    function claimLiquidity() external {
+    function claimCEX() external {
         uint256 amount = cexAllocation[msg.sender];
-        require(amount > 0, "no allocation");
-        require(!cexClaimed[msg.sender], "already claimed");
-
+        require(amount > 0 && !cexClaimed[msg.sender], "Cannot claim");
         cexClaimed[msg.sender] = true;
-        _transfer(address(this), msg.sender, amount);
-        emit CEXClaimed(msg.sender, amount);
+        token.safeTransfer(msg.sender, amount);
     }
 
-    // fallback to receive native
-    receive() external payable {}
+    // ----- Team / Foundation Vesting -----
+    uint256 public constant VESTING_DURATION = 10 * 365 days;
+    uint256 public constant CLAIM_INTERVAL = 182 days;
+
+    struct Vesting { uint256 totalAllocated; uint256 released; uint256 startTime; uint8 lastReleasePeriod; }
+    Vesting public teamVesting;
+    Vesting public foundationVesting;
+    address public teamWallet;
+    address public foundationWallet;
+
+    function initVesting(address _team, address _foundation, uint256 teamAmount, uint256 foundationAmount) external onlySigner {
+        bytes memory data = abi.encodeWithSignature("initVestingInternal(address,address,uint256,uint256)", _team, _foundation, teamAmount, foundationAmount);
+        _submitAndExecute(address(this), data);
+    }
+    function initVestingInternal(address _team, address _foundation, uint256 teamAmount, uint256 foundationAmount) external {
+        require(msg.sender == address(this), "Internal only");
+        teamWallet = _team;
+        foundationWallet = _foundation;
+        teamVesting.totalAllocated = teamAmount;
+        teamVesting.startTime = block.timestamp;
+        teamAllocated = teamAmount;
+        foundationVesting.totalAllocated = foundationAmount;
+        foundationVesting.startTime = block.timestamp;
+        foundationAllocated = foundationAmount;
+
+        liquidityAllocated = MAX_SUPPLY - presaleSold - distributedAirdrops - teamAllocated - foundationAllocated;
+    }
+
+    function releaseVesting() public {
+        _release(teamVesting, teamWallet);
+        _release(foundationVesting, foundationWallet);
+    }
+
+    function _currentPeriod(uint256 startTime) internal view returns (uint8) {
+        uint256 elapsed = block.timestamp > startTime ? block.timestamp - startTime : 0;
+        return uint8(elapsed / CLAIM_INTERVAL);
+    }
+
+    function _release(Vesting storage v, address wallet) internal {
+        uint8 current = _currentPeriod(v.startTime);
+        if (current > v.lastReleasePeriod && v.released < v.totalAllocated) {
+            uint256 vested = (v.totalAllocated * (current + 1) * CLAIM_INTERVAL) / VESTING_DURATION;
+            uint256 releasable = vested - v.released;
+            if (releasable > 0) {
+                v.released += releasable;
+                v.lastReleasePeriod = current;
+                token.safeTransfer(wallet, releasable);
+            }
+        }
+    }
 }
